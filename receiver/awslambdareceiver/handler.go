@@ -158,6 +158,93 @@ func (*s3Handler[T]) parseEvent(raw json.RawMessage) (event events.S3EventRecord
 	return message.Records[0], nil
 }
 
+// multiFormatS3LogsHandler handles S3 events with multiple log formats.
+// It routes each S3 object to the appropriate unmarshaler based on path pattern matching.
+type multiFormatS3LogsHandler struct {
+	s3Service internal.S3Service
+	logger    *zap.Logger
+	router    *logsEncodingRouter
+	consumer  s3EventConsumerFunc[plog.Logs]
+}
+
+func newMultiFormatS3LogsHandler(
+	service internal.S3Service,
+	baseLogger *zap.Logger,
+	router *logsEncodingRouter,
+	consumer s3EventConsumerFunc[plog.Logs],
+) *multiFormatS3LogsHandler {
+	return &multiFormatS3LogsHandler{
+		s3Service: service,
+		logger:    baseLogger.Named("s3-multiformat"),
+		router:    router,
+		consumer:  consumer,
+	}
+}
+
+func (*multiFormatS3LogsHandler) handlerType() eventType {
+	return s3Event
+}
+
+func (s *multiFormatS3LogsHandler) handle(ctx context.Context, event json.RawMessage) error {
+	parsedEvent, err := s.parseEvent(event)
+	if err != nil {
+		return fmt.Errorf("failed to parse the event: %w", err)
+	}
+
+	objectKey := parsedEvent.S3.Object.Key
+
+	s.logger.Debug("Processing S3 event notification (multi-format).",
+		zap.String("File", objectKey),
+		zap.String("S3Bucket", parsedEvent.S3.Bucket.Arn),
+	)
+
+	// Skip processing zero length objects
+	if parsedEvent.S3.Object.Size == 0 {
+		s.logger.Info("Empty object, skipping download", zap.String("File", objectKey))
+		return nil
+	}
+
+	// Route to appropriate unmarshaler based on object key
+	unmarshaler, formatName, err := s.router.GetUnmarshaler(objectKey)
+	if err != nil {
+		return fmt.Errorf("failed to route S3 object: %w", err)
+	}
+
+	s.logger.Debug("Matched format for S3 object",
+		zap.String("File", objectKey),
+		zap.String("Format", formatName),
+	)
+
+	body, err := s.s3Service.ReadObject(ctx, parsedEvent.S3.Bucket.Name, objectKey)
+	if err != nil {
+		return err
+	}
+
+	data, err := unmarshaler(body)
+	if err != nil {
+		return fmt.Errorf("failed to unmarshal S3 data with format %q: %w", formatName, err)
+	}
+
+	if err := s.consumer(ctx, parsedEvent, data); err != nil {
+		return checkConsumerErrorAndWrap(err)
+	}
+
+	return nil
+}
+
+func (*multiFormatS3LogsHandler) parseEvent(raw json.RawMessage) (event events.S3EventRecord, err error) {
+	var message events.S3Event
+	if err := gojson.Unmarshal(raw, &message); err != nil {
+		return events.S3EventRecord{}, fmt.Errorf("failed to unmarshal S3 event notification: %w", err)
+	}
+
+	if len(message.Records) > 1 || len(message.Records) == 0 {
+		return events.S3EventRecord{}, fmt.Errorf("s3 event notification should contain one record instead of %d", len(message.Records))
+	}
+
+	return message.Records[0], nil
+}
+
 // cwLogsSubscriptionHandler is specialized in CloudWatch log stream subscription filter events
 type cwLogsSubscriptionHandler struct {
 	unmarshal unmarshalFunc[plog.Logs]

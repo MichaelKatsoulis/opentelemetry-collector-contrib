@@ -228,17 +228,50 @@ func newLogsHandler(
 	s3Provider internal.S3Provider,
 ) (handlerProvider, error) {
 	logger := set.Logger
-	var s3Unmarshaler unmarshalFunc[plog.Logs] = bytesToPlogs
-	if cfg.S3.Encoding != "" {
-		logger.Info("Using configured S3 encoding for logs", zap.String("encoding", cfg.S3.Encoding))
-		extension, err := loadEncodingExtension[plog.Unmarshaler](host, cfg.S3.Encoding, "logs")
+
+	s3Service, err := s3Provider.GetService(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("unable to load the S3 service: %w", err)
+	}
+
+	// Wrapper function that sets observed timestamp for S3 logs
+	logsConsumer := func(ctx context.Context, event events.S3EventRecord, logs plog.Logs) error {
+		enrichS3Logs(logs, event)
+		return next.ConsumeLogs(ctx, logs)
+	}
+
+	// Register handlers. Logs supports S3 and CloudWatch Logs subscription events.
+	registry := make(handlerRegistry)
+
+	// S3 handler: multi-format, single-format, or raw passthrough
+	if len(cfg.S3.Formats) > 0 {
+		// Multi-format mode: use router
+		router, err := buildLogsEncodingRouter(host, cfg.S3, logger)
 		if err != nil {
 			return nil, err
 		}
 
-		s3Unmarshaler = extension.UnmarshalLogs
+		registry[s3Event] = func() lambdaEventHandler {
+			return newMultiFormatS3LogsHandler(s3Service, logger, router, logsConsumer)
+		}
+	} else {
+		// Single-format or raw passthrough mode
+		var s3Unmarshaler unmarshalFunc[plog.Logs] = bytesToPlogs
+		if cfg.S3.Encoding != "" {
+			logger.Info("Using configured S3 encoding for logs", zap.String("encoding", cfg.S3.Encoding))
+			extension, err := loadEncodingExtension[plog.Unmarshaler](host, cfg.S3.Encoding, "logs")
+			if err != nil {
+				return nil, err
+			}
+			s3Unmarshaler = extension.UnmarshalLogs
+		}
+
+		registry[s3Event] = func() lambdaEventHandler {
+			return newS3Handler(s3Service, logger, s3Unmarshaler, logsConsumer)
+		}
 	}
 
+	// CloudWatch handler (remains single-format)
 	var cwUnmarshaler unmarshalFunc[plog.Logs] = cwLogsToPlogs
 	if cfg.CloudWatch.Encoding != "" {
 		logger.Info("Using configured CloudWatch encoding for logs", zap.String("encoding", cfg.CloudWatch.Encoding))
@@ -246,25 +279,7 @@ func newLogsHandler(
 		if err != nil {
 			return nil, err
 		}
-
 		cwUnmarshaler = extension.UnmarshalLogs
-	}
-
-	s3Service, err := s3Provider.GetService(ctx)
-	if err != nil {
-		return nil, fmt.Errorf("unable to load the S3 service: %w", err)
-	}
-
-	// Register handlers. Logs supports S3 and CloudWatch Logs subscription events.
-	registry := make(handlerRegistry)
-	registry[s3Event] = func() lambdaEventHandler {
-		// Wrapper function that sets observed timestamp for S3 logs
-		logsConsumer := func(ctx context.Context, event events.S3EventRecord, logs plog.Logs) error {
-			enrichS3Logs(logs, event)
-			return next.ConsumeLogs(ctx, logs)
-		}
-
-		return newS3Handler(s3Service, logger, s3Unmarshaler, logsConsumer)
 	}
 
 	registry[cwEvent] = func() lambdaEventHandler {
@@ -272,6 +287,37 @@ func newLogsHandler(
 	}
 
 	return newHandlerProvider(registry), nil
+}
+
+// buildLogsEncodingRouter creates a router for multi-format S3 log processing.
+func buildLogsEncodingRouter(host component.Host, s3Cfg S3Config, logger *zap.Logger) (*logsEncodingRouter, error) {
+	sortedFormats := s3Cfg.SortedFormats()
+	encoders := make(map[string]unmarshalFunc[plog.Logs])
+
+	for _, format := range sortedFormats {
+		if format.Encoding == "" {
+			// No encoding = raw passthrough, handled by defaultUnmarshaler
+			logger.Info("Format configured for raw passthrough",
+				zap.String("name", format.Name),
+				zap.String("path_pattern", format.ResolvePathPattern()),
+			)
+			continue
+		}
+
+		logger.Info("Loading encoding extension for format",
+			zap.String("name", format.Name),
+			zap.String("encoding", format.Encoding),
+			zap.String("path_pattern", format.ResolvePathPattern()),
+		)
+
+		extension, err := loadEncodingExtension[plog.Unmarshaler](host, format.Encoding, "logs")
+		if err != nil {
+			return nil, fmt.Errorf("failed to load encoding for format %q: %w", format.Name, err)
+		}
+		encoders[format.Name] = extension.UnmarshalLogs
+	}
+
+	return newLogsEncodingRouter(sortedFormats, encoders, bytesToPlogs), nil
 }
 
 func newMetricsHandler(

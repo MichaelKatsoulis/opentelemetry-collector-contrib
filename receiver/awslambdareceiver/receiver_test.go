@@ -95,6 +95,103 @@ func TestCreateLogs(t *testing.T) {
 	require.NotZero(t, sink.LogRecordCount(), "Expected logs to be sent to sink")
 }
 
+func TestCreateLogsMultiFormat(t *testing.T) {
+	// Set Lambda environment variables required by Start()
+	t.Setenv("AWS_EXECUTION_ENV", "AWS_Lambda_python3.12")
+
+	// Create receiver using factory with multi-format S3 config.
+	factory := NewFactory()
+	cfg := factory.CreateDefaultConfig().(*Config)
+	cfg.S3.Formats = []S3Format{
+		{Name: "vpcflow", Encoding: "awslogs_encoding/vpc"},
+		{Name: "cloudtrail", Encoding: "awslogs_encoding/ct"},
+	}
+	settings := receivertest.NewNopSettings(metadata.Type)
+
+	sink := consumertest.LogsSink{}
+	receiver, err := factory.CreateLogs(
+		t.Context(),
+		settings,
+		cfg,
+		&sink,
+	)
+	require.NoError(t, err)
+	require.NotNil(t, receiver)
+
+	goMock := gomock.NewController(t)
+	s3Service := internal.NewMockS3Service(goMock)
+	s3Provider := internal.NewMockS3Provider(goMock)
+	s3Provider.EXPECT().GetService(gomock.Any()).AnyTimes().Return(s3Service, nil)
+
+	// Test data - VPC flow log content
+	vpcData := []byte("vpc flow log data")
+	cloudtrailData := []byte("cloudtrail log data")
+
+	// Set up expectations for both file types
+	s3Service.EXPECT().ReadObject(gomock.Any(), "test-bucket", "AWSLogs/123/vpcflowlogs/file.log").
+		Times(1).Return(vpcData, nil)
+	s3Service.EXPECT().ReadObject(gomock.Any(), "test-bucket", "AWSLogs/123/CloudTrail/file.json").
+		Times(1).Return(cloudtrailData, nil)
+
+	// Register extensions for both formats
+	host := mockHost{GetFunc: func() map[component.ID]component.Component {
+		return map[component.ID]component.Component{
+			component.MustNewIDWithName("awslogs_encoding", "vpc"): &mockExtensionWithPLogUnmarshaler{
+				Unmarshaler: unmarshalLogsFunc(func(data []byte) (plog.Logs, error) {
+					require.Equal(t, string(vpcData), string(data))
+					logs := plog.NewLogs()
+					logs.ResourceLogs().AppendEmpty().ScopeLogs().AppendEmpty().LogRecords().AppendEmpty()
+					return logs, nil
+				}),
+			},
+			component.MustNewIDWithName("awslogs_encoding", "ct"): &mockExtensionWithPLogUnmarshaler{
+				Unmarshaler: unmarshalLogsFunc(func(data []byte) (plog.Logs, error) {
+					require.Equal(t, string(cloudtrailData), string(data))
+					logs := plog.NewLogs()
+					logs.ResourceLogs().AppendEmpty().ScopeLogs().AppendEmpty().LogRecords().AppendEmpty()
+					return logs, nil
+				}),
+			},
+		}
+	}}
+
+	// Initialize the handlerProvider manually
+	awsReceiver := receiver.(*awsLambdaReceiver)
+	awsReceiver.hp, err = newLogsHandler(t.Context(), cfg, settings, host, &sink, s3Provider)
+	require.NoError(t, err)
+
+	// Process VPC flow log S3 event
+	vpcEvent, err := json.Marshal(events.S3Event{
+		Records: []events.S3EventRecord{{
+			EventSource: "aws:s3",
+			S3: events.S3Entity{
+				Bucket: events.S3Bucket{Name: "test-bucket", Arn: "arn:aws:s3:::test-bucket"},
+				Object: events.S3Object{Key: "AWSLogs/123/vpcflowlogs/file.log", Size: int64(len(vpcData))},
+			},
+		}},
+	})
+	require.NoError(t, err)
+	err = awsReceiver.processLambdaEvent(t.Context(), vpcEvent)
+	require.NoError(t, err)
+
+	// Process CloudTrail S3 event
+	ctEvent, err := json.Marshal(events.S3Event{
+		Records: []events.S3EventRecord{{
+			EventSource: "aws:s3",
+			S3: events.S3Entity{
+				Bucket: events.S3Bucket{Name: "test-bucket", Arn: "arn:aws:s3:::test-bucket"},
+				Object: events.S3Object{Key: "AWSLogs/123/CloudTrail/file.json", Size: int64(len(cloudtrailData))},
+			},
+		}},
+	})
+	require.NoError(t, err)
+	err = awsReceiver.processLambdaEvent(t.Context(), ctEvent)
+	require.NoError(t, err)
+
+	// Verify logs were sent to the sink (2 events = 2 log records)
+	require.Equal(t, 2, sink.LogRecordCount(), "Expected 2 logs to be sent to sink")
+}
+
 func TestCreateMetrics(t *testing.T) {
 	// Set Lambda environment variables required by Start()
 	t.Setenv("AWS_EXECUTION_ENV", "AWS_Lambda_python3.12")
@@ -194,7 +291,7 @@ func TestStartRequiresLambdaEnvironment(t *testing.T) {
 
 func TestProcessLambdaEvent(t *testing.T) {
 	commonCfg := Config{
-		S3: sharedConfig{
+		S3: S3Config{
 			Encoding: "awslogs",
 		},
 	}
